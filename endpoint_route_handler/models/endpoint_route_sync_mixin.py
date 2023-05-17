@@ -84,6 +84,15 @@ class EndpointRouteSyncMixin(models.AbstractModel):
             self._unregister_controllers()
         return super().unlink()
 
+    def _register_hook(self):
+        super()._register_hook()
+        if not self._abstract and not self._transient:
+            # Ensure existing active records are loaded at startup.
+            # Pass `init` to bypass routing map refresh
+            # since this piece of code runs only when the model is loaded.
+            domain = [("active", "=", True), ("registry_sync", "=", True)]
+            self.search(domain)._register_controllers(init=True)
+
     def _register_controllers(self, init=False, options=None):
         if not self:
             return
