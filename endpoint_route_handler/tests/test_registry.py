@@ -2,6 +2,8 @@
 # @author: Simone Orsi <simone.orsi@camptocamp.com>
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
 
+from unittest import mock
+
 from psycopg2 import DatabaseError
 
 from odoo.tests.common import TransactionCase, tagged
@@ -227,3 +229,185 @@ class TestRegistry(TransactionCase):
         self.assertEqual([rule.key for rule in rules], ["route1", "route2", "route3"])
         rules = self.reg.get_rules_by_group("two")
         self.assertEqual([rule.key for rule in rules], ["route5", "route6"])
+
+    def test_update_rules_advisory_lock_not_acquired(self):
+        """Test that update_rules skips when advisory lock cannot be acquired."""
+        rules = []
+        for i in range(1, 3):
+            rule = self.reg.make_rule(
+                f"route{i}",
+                f"/test/{i}",
+                {
+                    "handler": {
+                        "klass_dotted_path": CTRLFake._path,
+                        "method_name": "handler1",
+                    }
+                },
+                {"routes": []},
+                str(i),
+                route_group="test_route_handler",
+            )
+            rules.append(rule)
+
+        # Mock pg_try_advisory_xact_lock to return False
+        original_execute = self.env.cr.execute
+
+        def mock_execute(sql, *args, **kwargs):
+            if "pg_try_advisory_xact_lock" in sql:
+                # Simulate lock not acquired
+                return None
+
+            return original_execute(sql, *args, **kwargs)
+
+        def mock_fetchone():
+            return [False]
+
+        with mock.patch.object(
+            self.env.cr, "execute", side_effect=mock_execute
+        ), mock.patch.object(self.env.cr, "fetchone", side_effect=mock_fetchone):
+            result = self.reg.update_rules(rules)
+
+        # Should return False and not create routes
+        self.assertFalse(result)
+        self.assertEqual(self._count_rules(), 0)
+
+    def test_update_rules_advisory_lock_acquired(self):
+        """Test that update_rules proceeds when advisory lock is acquired."""
+        rules = []
+        for i in range(1, 3):
+            rule = self.reg.make_rule(
+                f"route{i}",
+                f"/test/{i}",
+                {
+                    "handler": {
+                        "klass_dotted_path": CTRLFake._path,
+                        "method_name": "handler1",
+                    }
+                },
+                {"routes": []},
+                str(i),
+                route_group="test_route_handler",
+            )
+            rules.append(rule)
+
+        # Advisory lock will be acquired (normal behavior)
+        result = self.reg.update_rules(rules)
+
+        # Should return True and create routes
+        self.assertTrue(result)
+        self.assertEqual(self._count_rules(), 2)
+
+    def test_advisory_lock_can_be_acquired(self):
+        """Test that advisory lock can be acquired successfully."""
+        lock_name = "endpoint_route_register:route1,route2"
+
+        # Lock acquisition should succeed
+        acquired = self.reg._try_advisory_lock(lock_name)
+        self.assertTrue(acquired, "Lock acquisition should succeed")
+
+        # In same session, acquiring again returns true (idempotent behavior)
+        acquired2 = self.reg._try_advisory_lock(lock_name)
+        self.assertTrue(
+            acquired2,
+            "Same session can 'acquire' lock again (idempotent in PostgreSQL)",
+        )
+
+    def test_advisory_lock_different_names_are_independent(self):
+        """Test that advisory locks with different names are independent."""
+        lock_name1 = "endpoint_route_register:route1,route2"
+        lock_name2 = "endpoint_route_register:route3,route4"
+
+        # Both locks should be acquirable since they have different names
+        acquired1 = self.reg._try_advisory_lock(lock_name1)
+        self.assertTrue(acquired1, "First lock should be acquired")
+
+        acquired2 = self.reg._try_advisory_lock(lock_name2)
+        self.assertTrue(acquired2, "Second lock with different name should be acquired")
+
+    def test_update_rules_uses_sorted_keys_for_lock(self):
+        """Test that update_rules generates consistent lock names from sorted keys."""
+        rules = []
+        # Create rules in non-sorted order
+        for key in ["route3", "route1", "route2"]:
+            rule = self.reg.make_rule(
+                key,
+                f"/test/{key}",
+                {
+                    "handler": {
+                        "klass_dotted_path": CTRLFake._path,
+                        "method_name": "handler1",
+                    }
+                },
+                {"routes": []},
+                key,
+                route_group="test_route_handler",
+            )
+            rules.append(rule)
+
+        # update_rules should sort keys internally for consistent lock name
+        # This test just verifies it doesn't crash and registers successfully
+        result = self.reg.update_rules(rules)
+        self.assertTrue(result, "update_rules should succeed with unsorted keys")
+        self.assertEqual(self._count_rules(), 3)
+
+        # Verify all routes were created
+        self.assertIsNotNone(self.reg._get_rule("route1"))
+        self.assertIsNotNone(self.reg._get_rule("route2"))
+        self.assertIsNotNone(self.reg._get_rule("route3"))
+
+    def test_update_rules_returns_false_when_no_rules(self):
+        """Test that update_rules returns False when given empty rules list."""
+        result = self.reg.update_rules([])
+        self.assertFalse(result, "update_rules should return False for empty list")
+        self.assertEqual(self._count_rules(), 0)
+
+    def test_update_handles_serialization_failure(self):
+        """Test that _update handles SerializationFailure gracefully."""
+        from psycopg2 import errors as pg_errors
+
+        # First create some routes
+        rules = []
+        for i in range(1, 3):
+            rule = self.reg.make_rule(
+                f"route{i}",
+                f"/test/{i}",
+                {
+                    "handler": {
+                        "klass_dotted_path": CTRLFake._path,
+                        "method_name": "handler1",
+                    }
+                },
+                {"routes": []},
+                str(i),
+                route_group="test_route_handler",
+            )
+            rules.append(rule)
+
+        # Create initial routes
+        self.reg.update_rules(rules)
+        self.assertEqual(self._count_rules(), 2)
+
+        # Modify rules to trigger update
+        for rule in rules:
+            rule.options = {
+                "handler": {
+                    "klass_dotted_path": CTRLFake._path,
+                    "method_name": "handler2",
+                }
+            }
+
+        # Mock cr.execute to raise SerializationFailure on FOR UPDATE
+        original_execute = self.env.cr.execute
+
+        def mock_execute(sql, *args, **kwargs):
+            if isinstance(sql, str) and "FOR UPDATE" in sql:
+                raise pg_errors.SerializationFailure(
+                    "could not serialize access due to concurrent update"
+                )
+            return original_execute(sql, *args, **kwargs)
+
+        with mock.patch.object(self.env.cr, "execute", side_effect=mock_execute):
+            result = self.reg.update_rules(rules)
+
+        # Should return False but not crash
+        self.assertFalse(result, "_update should return False on SerializationFailure")
