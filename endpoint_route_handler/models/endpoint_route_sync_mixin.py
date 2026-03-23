@@ -88,7 +88,8 @@ class EndpointRouteSyncMixin(models.AbstractModel):
         if not self:
             return
         rules = self._prepare_endpoint_rules(options=options)
-        self._endpoint_registry.update_rules(rules, init=init)
+        if self._endpoint_registry.update_rules(rules, init=init):
+            self.env["ir.http"]._reset_endpoint_route_version_check()
         _logger.debug(
             "%s registered controllers: %s",
             self._name,

@@ -2,6 +2,8 @@
 # @author: Simone Orsi <simone.orsi@camptocamp.com>
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
 
+from unittest import mock
+
 from psycopg2 import DatabaseError
 
 from odoo.tests.common import TransactionCase, tagged
@@ -159,6 +161,15 @@ class TestRegistry(TransactionCase):
             self.reg._get_rule("route2").handler_options.method_name, "handler3"
         )
 
+    def test_update_rule_skipped_when_unchanged(self):
+        """update_rules must skip UPDATE when the rule data hasn't changed."""
+        rule1, rule2 = self._make_rules(stop=3)
+        version_before = self.reg.last_version()
+        # Re-submit the exact same rules — no DB write should happen.
+        self.assertFalse(self.reg.update_rules([rule1, rule2]))
+        version_after = self.reg.last_version()
+        self.assertEqual(version_before, version_after)
+
     @mute_logger("odoo.sql_db")
     def test_rule_constraints(self):
         rule1, rule2 = self._make_rules(stop=3)
@@ -227,3 +238,78 @@ class TestRegistry(TransactionCase):
         self.assertEqual([rule.key for rule in rules], ["route1", "route2", "route3"])
         rules = self.reg.get_rules_by_group("two")
         self.assertEqual([rule.key for rule in rules], ["route5", "route6"])
+
+    def test_update_rules_returns_false_when_no_rules(self):
+        """update_rules returns False when given empty rules list."""
+        result = self.reg.update_rules([])
+        self.assertFalse(result)
+        self.assertEqual(self._count_rules(), 0)
+
+    def test_advisory_lock_can_be_acquired(self):
+        """Advisory lock can be acquired successfully."""
+        acquired = self.reg._try_advisory_lock("endpoint_route_register:route1")
+        self.assertTrue(acquired)
+        # Same session can acquire again (idempotent in PostgreSQL)
+        acquired2 = self.reg._try_advisory_lock("endpoint_route_register:route1")
+        self.assertTrue(acquired2)
+
+    def test_advisory_lock_different_names_are_independent(self):
+        """Advisory locks with different names are independent."""
+        acquired1 = self.reg._try_advisory_lock("endpoint_route_register:route1")
+        self.assertTrue(acquired1)
+        acquired2 = self.reg._try_advisory_lock("endpoint_route_register:route2")
+        self.assertTrue(acquired2)
+
+    def test_update_rules_advisory_lock_not_acquired(self):
+        """update_rules skips when advisory lock cannot be acquired."""
+        rules = self._make_rules(stop=3)
+        # Wipe to start fresh
+        EndpointRegistry.wipe_registry_for(self.env.cr)
+        self.assertEqual(self._count_rules(), 0)
+
+        # Mock advisory lock to return False
+        original_execute = self.env.cr.execute
+
+        def mock_execute(query, *args, **kwargs):
+            if isinstance(query, str) and "pg_try_advisory_xact_lock" in query:
+                return None
+            return original_execute(query, *args, **kwargs)
+
+        def mock_fetchone():
+            return [False]
+
+        with mock.patch.object(
+            self.env.cr, "execute", side_effect=mock_execute
+        ), mock.patch.object(self.env.cr, "fetchone", side_effect=mock_fetchone):
+            result = self.reg.update_rules(rules)
+
+        self.assertFalse(result)
+        self.assertEqual(self._count_rules(), 0)
+
+    def test_update_handles_serialization_failure(self):
+        """_update handles SerializationFailure gracefully."""
+        from psycopg2 import errors as pg_errors
+
+        rules = self._make_rules(stop=3)
+        # Modify rules to trigger update
+        for rule in rules:
+            rule.options = {
+                "handler": {
+                    "klass_dotted_path": CTRLFake._path,
+                    "method_name": "handler2",
+                }
+            }
+
+        original_execute = self.env.cr.execute
+
+        def mock_execute(query, *args, **kwargs):
+            if isinstance(query, str) and "FOR UPDATE" in query:
+                raise pg_errors.SerializationFailure(
+                    "could not serialize access due to concurrent update"
+                )
+            return original_execute(query, *args, **kwargs)
+
+        with mock.patch.object(self.env.cr, "execute", side_effect=mock_execute):
+            result = self.reg.update_rules(rules)
+
+        self.assertFalse(result)

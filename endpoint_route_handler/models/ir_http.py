@@ -3,6 +3,7 @@
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
 
 import logging
+import time
 from itertools import chain
 
 import werkzeug
@@ -12,6 +13,12 @@ from odoo import http, models, registry as registry_get
 from ..registry import EndpointRegistry
 
 _logger = logging.getLogger(__name__)
+
+# TTL in seconds for the endpoint route version cache.
+# During this window, routing_map() skips opening a dedicated cursor
+# to query the endpoint_route_version sequence, avoiding ~0.87s
+# regeneration storms when the version hasn't actually changed.
+_VERSION_CHECK_TTL = 30
 
 
 class IrHttp(models.AbstractModel):
@@ -40,6 +47,21 @@ class IrHttp(models.AbstractModel):
                 yield (url, endpoint)
 
     @classmethod
+    def _endpoint_route_version_needs_check(cls):
+        """Return True if enough time has passed since the last version check."""
+        last_check = getattr(cls, "_endpoint_route_last_check", 0.0)
+        return (time.monotonic() - last_check) >= _VERSION_CHECK_TTL
+
+    @classmethod
+    def _reset_endpoint_route_version_check(cls):
+        """Force the next routing_map() call to re-check the DB version.
+
+        Called after rules are created/updated so that the TTL cache
+        does not hide a version bump from the current process.
+        """
+        cls._endpoint_route_last_check = 0.0
+
+    @classmethod
     def routing_map(cls, key=None):
         # When the request cursor is used to instantiate the EndpointRegistry
         # in the call to routing_map, the READ REPEATABLE isolation level
@@ -57,27 +79,26 @@ class IrHttp(models.AbstractModel):
         # ensure no read is performed on the database using the request cursor
         # which will in turn use the updated value of the oauth token to compute
         # the session token, and the security check will not fail.
-        registry = registry_get(http.request.env.cr.dbname)
-        cr = registry.cursor()
-        try:
-            last_version = cls._get_routing_map_last_version(cr)
-            if not hasattr(cls, "_routing_map"):
-                _logger.debug(
-                    "routing map just initialized, store last update for this env"
-                )
-                # routing map just initialized, store last update for this env
-                cls._endpoint_route_last_version = last_version
-            elif cls._endpoint_route_last_version < last_version:
-                _logger.info("Endpoint registry updated, reset routing map")
-                cls._routing_map = {}
-                cls._rewrite_len = {}
-                cls._endpoint_route_last_version = last_version
-        finally:
-            # No commit is needed here as nothing should be modified since
-            # this cursor is only here to read the last version of the routing
-            # map in a different cursor than the request one, see above comment.
-            cr.rollback()
-            cr.close()
+        if cls._endpoint_route_version_needs_check():
+            registry = registry_get(http.request.env.cr.dbname)
+            cr = registry.cursor()
+            try:
+                last_version = cls._get_routing_map_last_version(cr)
+                if not hasattr(cls, "_routing_map"):
+                    _logger.debug(
+                        "routing map just initialized, "
+                        "store last update for this env"
+                    )
+                    cls._endpoint_route_last_version = last_version
+                elif cls._endpoint_route_last_version < last_version:
+                    _logger.info("Endpoint registry updated, reset routing map")
+                    cls._routing_map = {}
+                    cls._rewrite_len = {}
+                    cls._endpoint_route_last_version = last_version
+            finally:
+                cr.rollback()
+                cr.close()
+            cls._endpoint_route_last_check = time.monotonic()
 
         return super().routing_map(key=key)
 
@@ -90,6 +111,8 @@ class IrHttp(models.AbstractModel):
         res = super()._clear_routing_map()
         if hasattr(cls, "_endpoint_route_last_version"):
             cls._endpoint_route_last_version = 0
+        # Force version re-check on next request after cache clear
+        cls._endpoint_route_last_check = 0.0
         return res
 
     @classmethod

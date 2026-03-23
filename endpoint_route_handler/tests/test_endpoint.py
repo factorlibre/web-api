@@ -173,4 +173,34 @@ class TestEndpointCrossEnv(CommonEndpoint):
                     env2["ir.http"]._endpoint_route_last_version > last_version0
                 )
 
+    def test_version_check_ttl_skips_within_window(self):
+        """Version check is skipped within the TTL window."""
+        IrHttp = type(self.env["ir.http"])
+        # Simulate a recent check
+        IrHttp._endpoint_route_last_check = __import__("time").monotonic()
+        self.assertFalse(IrHttp._endpoint_route_version_needs_check())
+
+    def test_version_check_ttl_triggers_after_expiry(self):
+        """Version check triggers once TTL has expired."""
+        IrHttp = type(self.env["ir.http"])
+        # Simulate an expired check (long ago)
+        IrHttp._endpoint_route_last_check = 0.0
+        self.assertTrue(IrHttp._endpoint_route_version_needs_check())
+
+    def test_clear_routing_map_resets_ttl(self):
+        """_clear_routing_map forces an immediate re-check."""
+        IrHttp = type(self.env["ir.http"])
+        IrHttp._endpoint_route_last_check = __import__("time").monotonic()
+        self.assertFalse(IrHttp._endpoint_route_version_needs_check())
+        self.env["ir.http"]._clear_routing_map()
+        self.assertTrue(IrHttp._endpoint_route_version_needs_check())
+
+    def test_reset_endpoint_route_version_check(self):
+        """_reset_endpoint_route_version_check forces re-check."""
+        IrHttp = type(self.env["ir.http"])
+        IrHttp._endpoint_route_last_check = __import__("time").monotonic()
+        self.assertFalse(IrHttp._endpoint_route_version_needs_check())
+        IrHttp._reset_endpoint_route_version_check()
+        self.assertTrue(IrHttp._endpoint_route_version_needs_check())
+
     # TODO: test unregister

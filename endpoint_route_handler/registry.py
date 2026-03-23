@@ -3,11 +3,13 @@
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
 
 import functools
+import hashlib
 import importlib
 import json
 import logging
+import struct
 
-from psycopg2 import sql
+from psycopg2 import errors, sql
 from psycopg2.extensions import AsIs
 from psycopg2.extras import execute_values
 
@@ -197,13 +199,20 @@ class EndpointRegistry:
         self.cr.execute(sql, (tuple(keys),), log_exceptions=False)
 
     def _update(self, rows_mapping):
-        self._lock_rows(tuple(rows_mapping.keys()))
-        return query_multi_update(
-            self.cr,
-            self._table,
-            tuple(rows_mapping.values()),
-            EndpointRule._ordered_columns(),
-        )
+        try:
+            self._lock_rows(tuple(rows_mapping.keys()))
+            return query_multi_update(
+                self.cr,
+                self._table,
+                tuple(rows_mapping.values()),
+                EndpointRule._ordered_columns(),
+            )
+        except errors.SerializationFailure:
+            _logger.info(
+                "Could not update routes due to concurrent update - "
+                "another worker already updated them"
+            )
+            return False
 
     def _create(self, rows_mapping):
         return query_insert(self.cr, self._table, list(rows_mapping.values()))
@@ -212,20 +221,58 @@ class EndpointRegistry:
         rules = self.get_rules(where=f"WHERE route_group='{group}'")
         return rules
 
+    def _try_advisory_lock(self, lock_name):
+        """Try to acquire a PostgreSQL transactional advisory lock.
+
+        Uses the same pattern as Odoo's connector module.
+        Lock is automatically released at transaction end.
+
+        :param lock_name: string identifier for the lock
+        :return: True if lock acquired, False otherwise
+        """
+        hasher = hashlib.sha1(str(lock_name).encode())
+        int_lock = struct.unpack("q", hasher.digest()[:8])[0]
+        self.cr.execute("SELECT pg_try_advisory_xact_lock(%s);", (int_lock,))
+        acquired = self.cr.fetchone()[0]
+        if not acquired:
+            _logger.info(
+                "Could not acquire advisory lock '%s' "
+                "- another worker is registering routes",
+                lock_name,
+            )
+        return acquired
+
     def update_rules(self, rules, init=False):
         """Add or update rules.
 
-        :param rule: list of instances of EndpointRule
-        :param force: replace rules forcedly
+        Uses PostgreSQL advisory locks to prevent concurrent registration.
+
+        :param rules: list of instances of EndpointRule
         :param init: given when adding rules for the first time
+        :return: True if rules were registered, False if skipped due to lock
         """
+        if not rules:
+            return False
+
         keys = [x.key for x in rules]
+
+        # Generate lock name from sorted keys for consistency
+        lock_name = "endpoint_route_register:{}".format(",".join(sorted(keys)))
+        if not self._try_advisory_lock(lock_name):
+            return False
+
         existing = {x.key: x for x in self.get_rules(keys=keys)}
         to_create = {}
         to_update = {}
         for rule in rules:
             if rule.key in existing:
-                to_update[rule.key] = rule.to_row()
+                # Skip UPDATE if rule data hasn't changed to avoid triggering
+                # the version-increment DB trigger unnecessarily.
+                # Each spurious UPDATE bumps the sequence, which forces a
+                # full routing-map regeneration (~0.87s) on the next request.
+                new_row = rule.to_row()
+                if new_row != existing[rule.key].to_row():
+                    to_update[rule.key] = new_row
             else:
                 to_create[rule.key] = rule.to_row()
         res = False
@@ -233,8 +280,9 @@ class EndpointRegistry:
             self._create(to_create)
             res = True
         if to_update:
-            self._update(to_update)
-            res = True
+            update_result = self._update(to_update)
+            if update_result is not False:
+                res = True
         return res
 
     def drop_rules(self, keys):
@@ -291,7 +339,9 @@ class EndpointRule:
         self.route = route
         self.options = options
         self.routing = routing
-        self.endpoint_hash = endpoint_hash
+        # Always store as str to match DB VARCHAR and ensure consistent
+        # comparisons between in-memory rules and DB-loaded rules.
+        self.endpoint_hash = str(endpoint_hash) if endpoint_hash is not None else None
         self.route_group = route_group
 
     def __repr__(self):

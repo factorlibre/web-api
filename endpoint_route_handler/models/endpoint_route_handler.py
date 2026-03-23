@@ -2,6 +2,7 @@
 # @author: Simone Orsi <simone.orsi@camptocamp.com>
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
 
+import hashlib
 import logging
 
 from odoo import _, api, exceptions, fields, models
@@ -143,7 +144,10 @@ class EndpointRouteHandler(models.AbstractModel):
         ]
         for rec, vals in zip(self, values):
             vals.pop("id", None)
-            rec.endpoint_hash = hash(tuple(vals.values()))
+            rec.endpoint_hash = hashlib.md5(
+                str(tuple(vals.values())).encode("utf-8"),
+                usedforsecurity=False,
+            ).hexdigest()
 
     def _routing_impacting_fields(self):
         return ("route", "auth_type", "request_method")
@@ -202,7 +206,8 @@ class EndpointRouteHandler(models.AbstractModel):
     def _register_single_controller(self, options=None, key=None, init=False):
         """Shortcut to register one single controller."""
         rule = self._make_controller_rule(options=options, key=key)
-        self._endpoint_registry.update_rules([rule], init=init)
+        if self._endpoint_registry.update_rules([rule], init=init):
+            self.env["ir.http"]._reset_endpoint_route_version_check()
         self._logger.debug(
             "Registered controller %s (auth: %s)", self.route, self.auth_type
         )
