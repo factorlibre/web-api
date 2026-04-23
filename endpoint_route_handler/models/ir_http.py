@@ -24,6 +24,17 @@ _VERSION_CHECK_TTL = 30
 class IrHttp(models.AbstractModel):
     _inherit = "ir.http"
 
+    # Safe defaults so that `routing_map()` never hits an AttributeError if
+    # `_routing_map` happens to be set on the class without this module's
+    # initialization branch having run first (e.g. registry rebuild during
+    # deploy, MRO attribute visibility). The `if not hasattr(cls, "_routing_map")`
+    # branch below still overwrites `_endpoint_route_last_version` with the
+    # real DB value on the first call of a fresh worker, so this default of 0
+    # is only ever observed in the pathological case — where a harmless extra
+    # regeneration resynchronizes the state.
+    _endpoint_route_last_version = 0
+    _endpoint_route_last_check = 0.0
+
     @classmethod
     def _endpoint_route_registry(cls, cr):
         return EndpointRegistry.registry_for(cr)
