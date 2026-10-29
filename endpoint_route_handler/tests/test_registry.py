@@ -313,3 +313,41 @@ class TestRegistry(TransactionCase):
             result = self.reg.update_rules(rules)
 
         self.assertFalse(result)
+
+    @mute_logger("odoo.sql_db")
+    def test_update_serialization_failure_keeps_cursor_usable(self):
+        """A real SerializationFailure in _update must not abort the transaction.
+
+        Another worker updating the same routes concurrently makes
+        `SELECT ... FOR UPDATE` fail in PostgreSQL. The failure is swallowed,
+        so the cursor must still be usable afterwards (eg: by the next
+        `_register_hook` while loading the registry).
+        """
+        rules = self._make_rules(stop=3)
+        for rule in rules:
+            rule.options = {
+                "handler": {
+                    "klass_dotted_path": CTRLFake._path,
+                    "method_name": "handler2",
+                }
+            }
+
+        def lock_rows_concurrent_update(keys):
+            # Raise the error from PostgreSQL itself so the transaction is
+            # really aborted, as with a concurrent update.
+            self.env.cr.execute(
+                "DO $$ BEGIN RAISE EXCEPTION 'could not serialize access "
+                "due to concurrent update' USING ERRCODE = 'serialization_failure';"
+                " END $$;"
+            )
+
+        with mock.patch.object(
+            EndpointRegistry, "_lock_rows", side_effect=lock_rows_concurrent_update
+        ):
+            result = self.reg.update_rules(rules)
+
+        self.assertFalse(result)
+        # Would raise InFailedSqlTransaction without the savepoint
+        self.assertEqual(self._count_rules(), 2)
+        for rule in self.reg.get_rules(keys=[x.key for x in rules]):
+            self.assertEqual(rule.handler_options.method_name, "handler1")

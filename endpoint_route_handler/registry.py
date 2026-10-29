@@ -199,14 +199,19 @@ class EndpointRegistry:
         self.cr.execute(sql, (tuple(keys),), log_exceptions=False)
 
     def _update(self, rows_mapping):
+        # The savepoint keeps the transaction usable if the update fails:
+        # without it the SerializationFailure aborts the whole transaction
+        # and the next query on this cursor raises InFailedSqlTransaction
+        # (eg: another module's _register_hook while loading the registry).
         try:
-            self._lock_rows(tuple(rows_mapping.keys()))
-            return query_multi_update(
-                self.cr,
-                self._table,
-                tuple(rows_mapping.values()),
-                EndpointRule._ordered_columns(),
-            )
+            with self.cr.savepoint(flush=False):
+                self._lock_rows(tuple(rows_mapping.keys()))
+                return query_multi_update(
+                    self.cr,
+                    self._table,
+                    tuple(rows_mapping.values()),
+                    EndpointRule._ordered_columns(),
+                )
         except errors.SerializationFailure:
             _logger.info(
                 "Could not update routes due to concurrent update - "
